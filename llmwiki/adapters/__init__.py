@@ -126,6 +126,13 @@ def discover_all() -> None:
     discover_contrib()
 
 
+
+    # --- BARTEK_BORROW_PATCH4 ---
+    from llmwiki.adapters import youtube  # noqa: F401
+    from llmwiki.adapters import x        # noqa: F401
+    from llmwiki.adapters import article  # noqa: F401
+
+
 def get_available() -> dict[str, type[BaseAdapter]]:
     """Return only adapters whose session store exists on this machine."""
     discover_adapters()
