@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from llmwiki import REPO_ROOT
-from llmwiki._frontmatter import parse_frontmatter
+from llmwiki._patch_compat import parse_frontmatter
 from llmwiki.confidence import compute_confidence
 
 WIKI_DIR = REPO_ROOT / "wiki"

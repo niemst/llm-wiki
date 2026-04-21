@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from llmwiki import REPO_ROOT
-from llmwiki._frontmatter import parse_frontmatter
+from llmwiki._patch_compat import parse_frontmatter
 
 SOURCES_DIR = REPO_ROOT / "raw" / "sessions"
 HOT_MD = REPO_ROOT / "wiki" / "hot.md"

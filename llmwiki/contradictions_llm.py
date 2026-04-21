@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from llmwiki import REPO_ROOT
-from llmwiki._frontmatter import parse_frontmatter
+from llmwiki._patch_compat import parse_frontmatter
 
 WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)")
 KEY_FACTS_RE = re.compile(r"## Key (?:Facts|Claims)\n(.*?)(?=\n## |\Z)", re.DOTALL)
