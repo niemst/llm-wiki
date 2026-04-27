@@ -1,4 +1,4 @@
-"""Full MCP server for llmwiki (v0.2).
+"""Full MCP server for llmwiki (v0.3).
 
 Exposes llmwiki operations as Model Context Protocol tools that any MCP
 client (Claude Desktop, Claude Code, Codex, Cline, Cursor, ChatGPT desktop)
@@ -13,6 +13,7 @@ v0.2 tool surface (6 production tools):
 - `wiki_read_page(path)` — return the full content of a single wiki page
 - `wiki_lint()` — run the lint workflow and return the report
 - `wiki_sync(dry_run?)` — trigger a converter sync
+- `wiki_add_entry(vault, title, type, body, ...)` — write a new wiki page directly
 
 Protocol: Model Context Protocol, stdio transport, JSON-RPC 2.0.
 Reference: https://modelcontextprotocol.io/
@@ -22,6 +23,7 @@ Ships as stdlib-only Python — no MCP SDK dependency.
 
 from __future__ import annotations
 
+import datetime
 import json
 import re
 import subprocess
@@ -39,6 +41,45 @@ SERVER_INFO = {
 }
 
 PROTOCOL_VERSION = "2024-11-05"
+
+
+# ─── Vault allowlist ──────────────────────────────────────────────────────
+# Top-level directories under wiki/ that agents are allowed to create pages in.
+# "rules" accepts sub-paths: rules/global, rules/<project>, etc.
+
+ALLOWED_VAULTS: tuple[str, ...] = (
+    "agents",
+    "brain",
+    "categories",
+    "comparisons",
+    "concepts",
+    "entities",
+    "meta",
+    "postmortems",
+    "projects",
+    "proposed-skills",
+    "questions",
+    "rules",
+    "skill-catalog",
+    "skill-test-reports",
+    "skills",
+    "sources",
+    "syntheses",
+    "team-prs",
+)
+
+VALID_TYPES: tuple[str, ...] = (
+    "rule",
+    "entity",
+    "skill",
+    "concept",
+    "synthesis",
+    "postmortem",
+    "question",
+    "source",
+    "project",
+    "note",
+)
 
 # ─── Tool definitions ─────────────────────────────────────────────────────
 
@@ -281,6 +322,68 @@ TOOLS = [
                     "default": 1,
                 },
             },
+        },
+    },
+    # v1.1 — wiki_add_entry: write a new wiki page without touching files manually
+    {
+        "name": "wiki_add_entry",
+        "description": (
+            "Write a new wiki page directly into the wiki. "
+            "Builds frontmatter from structured metadata fields and writes the file. "
+            "Use this instead of manually creating files. "
+            "Call wiki_list_vaults first if unsure which vault to use."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vault": {
+                    "type": "string",
+                    "description": (
+                        "Target vault (directory under wiki/). "
+                        "For rules use 'rules/global' or 'rules/<project>'. "
+                        "Call wiki_list_vaults to see all options."
+                    ),
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Human-readable page title (goes into frontmatter).",
+                },
+                "type": {
+                    "type": "string",
+                    "enum": list(VALID_TYPES),
+                    "description": "Page type for frontmatter.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Main markdown body (everything after the frontmatter).",
+                },
+                "slug": {
+                    "type": "string",
+                    "description": "Filename slug (auto-generated from title if omitted).",
+                },
+                "meta": {
+                    "type": "object",
+                    "description": (
+                        "Additional frontmatter fields as a flat key-value object. "
+                        "Common keys: severity, prefer, over, rationale, project, "
+                        "tags (array), confidence (0-1), lifecycle, applies_when (object), source."
+                    ),
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "Allow overwriting an existing file (default false).",
+                    "default": False,
+                },
+            },
+            "required": ["vault", "title", "type", "body"],
+        },
+    },
+    {
+        "name": "wiki_list_vaults",
+        "description": "List allowed vault names (directories under wiki/) that wiki_add_entry accepts.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
         },
     },
 ]
@@ -953,6 +1056,129 @@ def tool_wiki_category_browse(args: dict[str, Any]) -> dict[str, Any]:
     return _ok(text)
 
 
+
+def _slugify(text: str) -> str:
+    """Convert title to a safe filename slug."""
+    slug = text.lower().strip()
+    slug = re.sub(r"[^\w\s-]", "", slug)
+    slug = re.sub(r"[\s_]+", "-", slug)
+    slug = re.sub(r"-{2,}", "-", slug)
+    return slug.strip("-")[:80]
+
+
+def _build_frontmatter(fields: dict[str, Any]) -> str:
+    """Serialize a dict to YAML frontmatter lines (simple, no dependency)."""
+    lines = ["---"]
+    for k, v in fields.items():
+        if v is None:
+            continue
+        if isinstance(v, list):
+            if not v:
+                continue
+            lines.append(f"{k}:")
+            for item in v:
+                lines.append(f"  - {item}")
+        elif isinstance(v, dict):
+            lines.append(f"{k}:")
+            for dk, dv in v.items():
+                lines.append(f"  {dk}: {dv}")
+        elif isinstance(v, bool):
+            lines.append(f"{k}: {str(v).lower()}")
+        elif isinstance(v, (int, float)):
+            lines.append(f"{k}: {v}")
+        else:
+            safe = str(v).replace('"', '\\"')
+            if any(c in str(v) for c in (": ", "#", "\n", "{")):
+                lines.append(f'{k}: "{safe}"')
+            else:
+                lines.append(f"{k}: {v}")
+    lines.append("---")
+    return "\n".join(lines)
+
+
+def _vault_allowed(vault: str) -> bool:
+    """Return True if vault is in ALLOWED_VAULTS or is rules/<subdir>."""
+    if vault in ALLOWED_VAULTS:
+        return True
+    # Allow rules/<anything> and other top-level/<subdir> combos
+    top = vault.split("/")[0]
+    return top in ALLOWED_VAULTS
+
+
+def tool_wiki_add_entry(args: dict[str, Any]) -> dict[str, Any]:
+    """Write a new wiki page (v1.1)."""
+    vault = (args.get("vault") or "").strip().strip("/")
+    title = (args.get("title") or "").strip()
+    entry_type = (args.get("type") or "").strip()
+    body = args.get("body") or ""
+    slug_override = (args.get("slug") or "").strip()
+    extra_meta: dict[str, Any] = args.get("meta") or {}
+    overwrite = bool(args.get("overwrite", False))
+
+    if not vault:
+        return _err("vault is required")
+    if not title:
+        return _err("title is required")
+    if not entry_type:
+        return _err("type is required")
+    if entry_type not in VALID_TYPES:
+        return _err(f"type '{entry_type}' not valid. Choose: {', '.join(VALID_TYPES)}")
+    if not _vault_allowed(vault):
+        top = vault.split("/")[0]
+        return _err(
+            f"vault '{vault}' not allowed. "
+            f"Top-level must be one of: {', '.join(sorted(ALLOWED_VAULTS))}"
+        )
+
+    today = datetime.date.today().isoformat()
+    slug = slug_override or _slugify(title)
+    filename = f"{today}-{slug}.md"
+
+    target_dir = (REPO_ROOT / "wiki" / vault).resolve()
+    try:
+        target_dir.relative_to(REPO_ROOT.resolve())
+    except ValueError:
+        return _err(f"vault path escapes repo root: {vault!r}")
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / filename
+
+    if target.exists() and not overwrite:
+        return _err(
+            f"file already exists: wiki/{vault}/{filename}. "
+            "Pass overwrite=true to replace."
+        )
+
+    # Build frontmatter: fixed fields first, then extra_meta
+    fm_fields: dict[str, Any] = {"title": title, "type": entry_type}
+    fm_fields.update(extra_meta)
+    if "date" not in fm_fields:
+        fm_fields["date"] = today
+    if "last_updated" not in fm_fields:
+        fm_fields["last_updated"] = today
+
+    frontmatter = _build_frontmatter(fm_fields)
+    content = frontmatter + "\n\n" + body.lstrip("\n")
+
+    try:
+        target.write_text(content, encoding="utf-8")
+    except OSError as e:
+        return _err(f"write failed: {e}")
+
+    rel = f"wiki/{vault}/{filename}"
+    return _ok(f"Created: {rel}\n\nFrontmatter fields: {', '.join(fm_fields.keys())}")
+
+
+def tool_wiki_list_vaults(args: dict[str, Any]) -> dict[str, Any]:
+    """List allowed vaults (v1.1)."""
+    wiki = REPO_ROOT / "wiki"
+    lines = ["Allowed vaults for wiki_add_entry:\n"]
+    for v in sorted(ALLOWED_VAULTS):
+        exists = (wiki / v).exists()
+        lines.append(f"  {'✓' if exists else '○'}  {v}")
+    lines.append("\nFor rules use: rules/global or rules/<project-slug>")
+    return _ok("\n".join(lines))
+
 TOOL_IMPLS = {
     "wiki_query": tool_wiki_query,
     "wiki_search": tool_wiki_search,
@@ -967,6 +1193,9 @@ TOOL_IMPLS = {
     "wiki_dashboard": tool_wiki_dashboard,
     "wiki_entity_search": tool_wiki_entity_search,
     "wiki_category_browse": tool_wiki_category_browse,
+    # v1.1
+    "wiki_add_entry": tool_wiki_add_entry,
+    "wiki_list_vaults": tool_wiki_list_vaults,
 }
 
 
