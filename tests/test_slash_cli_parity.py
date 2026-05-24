@@ -29,6 +29,7 @@ SLASH_DIR = REPO_ROOT / ".claude" / "commands"
 # match). Listing them explicitly so future authors can't accidentally
 # skip the parity check for a real wrapper.
 NON_WRAPPER_SLASHES = {
+    "wiki-autoresearch",  # autoresearch loop, orchestrates multiple steps
     "wiki-ingest",     # prompt-driven ingest workflow
     "wiki-query",      # model-orchestrated query workflow
     "wiki-reflect",    # higher-order self-reflection, no single CLI
