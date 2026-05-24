@@ -28,6 +28,9 @@ jobs:
   link-check:
     name: Lychee external link scan
     runs-on: ubuntu-latest
+    # Skip on forks: the create-issue step needs Issues enabled on the running
+    # repo, which forks typically disable. Upstream keeps tracking; forks no-op.
+    if: ${{ !github.event.repository.fork }}
     steps:
       - uses: actions/checkout@v4
 
