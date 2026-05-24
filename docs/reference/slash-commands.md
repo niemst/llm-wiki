@@ -11,7 +11,7 @@ what it does, what it runs under the hood, and a realistic invocation
 example. Use these inside **Claude Code** — Codex CLI picks the same
 files up via `install-skills`.
 
-Summary of **18 commands in 4 groups**:
+Summary of **19 commands in 4 groups**:
 
 | Group | Commands |
 |---|---|
@@ -375,6 +375,25 @@ instead of chaining `/wiki-build` + `/wiki-graph` + `/wiki-lint` yourself.
 Pass `--strict` to turn any lint warning into a non-zero exit, which is
 exactly what CI wants. Pass `--skip-graph` or `--graph-engine builtin`
 when the optional Graphify backend is not installed.
+
+---
+
+### `/wiki-autoresearch`
+
+**What:** run an autoresearch loop against the wiki — pick an open
+question, research it, update the relevant page.
+
+**Wraps:** governance + ingest + `/wiki-update` chain (no single CLI
+subcommand; the slash command drives the loop).
+
+**Example:**
+
+```
+/wiki-autoresearch [topic or slug]
+```
+
+Pass an open question slug or a free-form topic. Leave empty to let
+the loop pick from the wiki's open-questions queue.
 
 ---
 

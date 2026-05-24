@@ -19,6 +19,10 @@ jobs:
     #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
 
     runs-on: ubuntu-latest
+    # Skip on forks: the Claude Code GitHub App must be installed on the
+    # running repo; forks don't carry that install, so the token exchange
+    # 401s every PR. Upstream keeps reviewing; forks no-op.
+    if: ${{ !github.event.repository.fork }}
     permissions:
       contents: read
       pull-requests: read
@@ -48,4 +52,3 @@ jobs:
           claude_args: '--model claude-opus-4-7'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-
