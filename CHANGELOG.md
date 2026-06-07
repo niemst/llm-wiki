@@ -8,6 +8,10 @@ Versions below 1.0 are pre-production — API and file formats may change.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`llmwiki/graphify_bridge.py`** — docstring `pip install` command corrected from `graphify` (single y) to `graphifyy` (double y). The PyPI package is named `graphifyy`; the old hint resolved to a non-existent package on PyPI (404). README of the upstream project explicitly notes: "the PyPI package is `graphifyy` (double-y). Other `graphify*` packages on PyPI are not affiliated." Module import (`import graphify`) is unchanged. Aligns the docstring with the `[project.optional-dependencies].graph = ["graphifyy>=0.4.20"]` requirement already declared in `pyproject.toml`.
+
 ## [1.3.82] — 2026-04-30
 
 #467 — healer-in-CI auto-patch comment workflow. Closes the Playwright Test Agents epic (#462).
