@@ -131,6 +131,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
     from llmwiki.convert import convert_all, DEFAULT_OUT_DIR, DEFAULT_STATE_FILE
 
+    # The MCP wiki_sync tool passes --dry-run by default (#sec-12).
+    dry_run = getattr(args, "dry_run", False)
+
     # v1.2 (#54): vault-overlay mode — resolve the vault early so bad
     # paths fail before we spend time converting sessions.
     # #470: actually wire the resolved vault root through to convert_all.
@@ -166,6 +169,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         project=args.project,
         include_current=args.include_current,
         force=args.force,
+        dry_run=dry_run,
     )
 
     # v1.0 (#157): auto-build and auto-lint after sync.
@@ -173,7 +177,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     # #470: when --vault was given, point the auto-build at the vault's
     # site/ tree too — otherwise the build silently writes to the
     # repo's site/ and the user's vault stays empty.
-    if rc == 0:
+    if rc == 0 and not dry_run:
         schedule = _load_schedule_config()
         site_root = (vault.root / "site") if vault_path else (REPO_ROOT / "site")
         if args.auto_build and _should_run_after_sync(schedule.get("build", "on-sync")):
@@ -700,6 +704,8 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--project", type=str, help="Substring filter on project slug")
     sync.add_argument("--include-current", action="store_true", help="Don't skip live sessions (<60 min)")
     sync.add_argument("--force", action="store_true", help="Ignore state file, reconvert everything")
+    sync.add_argument("--dry-run", action="store_true",
+                      help="List what would be converted; write nothing (no state, raw, build or lint)")
     sync.add_argument(
         "--auto-build", action=argparse.BooleanOptionalAction, default=True,
         help="After sync, rebuild the site when sessions_config.json's "
