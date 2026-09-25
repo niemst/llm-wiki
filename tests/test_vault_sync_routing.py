@@ -178,3 +178,20 @@ def test_vault_sync_does_not_pollute_repo_paths(tmp_path: Path):
 
     assert captured["out_dir"] != DEFAULT_OUT_DIR
     assert captured["state_file"] != DEFAULT_STATE_FILE
+
+
+def test_dry_run_reaches_convert_all_and_skips_build_and_lint():
+    """MCP wiki_sync runs `llmwiki sync --dry-run` by default; the flag
+    must parse and must not trigger auto-build or auto-lint writes."""
+    from llmwiki.cli import build_parser, cmd_sync
+
+    args = build_parser().parse_args(["sync", "--dry-run"])
+    assert args.dry_run is True
+
+    captured, fake_convert_all = _capture_convert_all_kwargs()
+    with patch("llmwiki.convert.convert_all", side_effect=fake_convert_all), \
+            patch("llmwiki.cli._load_schedule_config") as schedule:
+        cmd_sync(_make_args(dry_run=True, auto_build=True, auto_lint=True))
+
+    assert captured["dry_run"] is True
+    schedule.assert_not_called()
