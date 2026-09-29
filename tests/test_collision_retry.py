@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -230,7 +231,43 @@ def test_resumed_session_overwrites_stale_disambig_with_new_content(tmp_path, mo
 
     counters = json.loads(state_file.read_text())["_counters"]["claude_code"]
     assert counters["errored"] == 0, counters
-    assert counters["converted"] == 1, counters
+    assert counters["refreshed"] == 1, counters
+    assert counters["converted"] == 0, counters
+
+
+def test_resumed_source_with_mismatched_session_id_still_errors(tmp_path, monkeypatch):
+    """Same source path, ``key in state`` -- but the existing raw file's
+    ``sessionId:`` frontmatter does not match this render's. The state
+    key alone is not a strong enough anchor (state can be wiped,
+    migrated, or hand-edited), so this must stay an unresolved error
+    and the existing file must NOT be overwritten.
+    """
+    home, proj, out_dir, state_file = _seed_env(tmp_path)
+    src = proj / "s.jsonl"
+    _write_jsonl(src, "resumed-session", "2026-04-16T10:00:00Z")
+    _patch(monkeypatch, home, out_dir, state_file)
+    c.discover_adapters()
+
+    _touch_and_sync(src, out_dir, state_file, 1000)
+    _touch_and_sync(src, out_dir, state_file, 2000)
+
+    outs = sorted(out_dir.rglob("*.md"))
+    disambiguated = next(p for p in outs if "--" in p.name)
+    tampered = re.sub(
+        r"^sessionId:.*$", "sessionId: someone-elses-session",
+        disambiguated.read_text(encoding="utf-8"), count=1, flags=re.MULTILINE,
+    )
+    disambiguated.write_text(tampered, encoding="utf-8")
+
+    rc = _touch_and_sync(src, out_dir, state_file, 3000)
+
+    assert disambiguated.read_text(encoding="utf-8") == tampered, (
+        "a session-id mismatch must not overwrite the existing raw file"
+    )
+    counters = json.loads(state_file.read_text())["_counters"]["claude_code"]
+    assert counters["errored"] == 1, counters
+    assert counters.get("refreshed", 0) == 0, counters
+    assert rc == 1
 
 
 def test_genuine_collision_between_two_sources_still_errors(tmp_path, monkeypatch):

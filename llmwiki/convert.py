@@ -125,15 +125,16 @@ def _raw_write_guard(
     source: str,
     adapter_name: str,
 ) -> None:
-    """Hard-guard raw/ immutability (#326).
+    """Hard-guard raw/ immutability (#326, hardened #wiki-sync-errors).
 
-    CLAUDE.md says "raw/ is immutable" but today the invariant is
-    enforced only by the mtime state file.  This helper turns it into
-    a runtime check: if ``out_path`` already exists and ``force`` is
-    False, raise ``FileExistsError`` so the caller can quarantine +
-    skip instead of silently overwriting.
-
-    Bypass only via the existing ``llmwiki sync --force`` flag.
+    CLAUDE.md says "raw/ is immutable, except that a source can refresh
+    its own earlier output" (identified by the state key AND a matching
+    ``sessionId`` frontmatter field -- see ``_session_id_of``). Every
+    other overwrite needs ``--force``. This helper enforces the
+    ``--force`` half: if ``out_path`` already exists and ``force`` is
+    False, raise ``FileExistsError`` so the caller can either refresh
+    (same-source refresh, see ``_session_id_of``) or quarantine (a real
+    clash) instead of silently overwriting.
     """
     if not out_path.exists() or force:
         return
@@ -159,10 +160,48 @@ def _is_resumed_source(state: dict[str, Any], key: str) -> bool:
 
     ``state[key]`` only ever gets set right after a successful write
     of THIS source (see the ``state[key] = mtime`` calls below), so
-    its presence disambiguates case 1 from case 2 without needing to
-    read the existing output file back off disk.
+    its presence is a necessary but NOT sufficient condition for case
+    1 -- state can be wiped, migrated, or hand-edited. The caller must
+    also confirm the ``sessionId`` frontmatter anchor via
+    ``_session_id_of`` before treating a collision as a refresh.
     """
     return key in state
+
+
+def _session_id_of(markdown: str) -> str | None:
+    """Pull the ``sessionId:`` frontmatter line ``render_session_markdown``
+    writes for every session (see ``session_id`` there). Returns ``None``
+    when absent -- e.g. a hand-edited or pre-#wiki-sync-errors raw file,
+    or a non-JSONL adapter's output, which never carries this field.
+    """
+    m = re.search(r"^sessionId:\s*(.+)$", markdown, re.MULTILINE)
+    return m.group(1).strip() if m else None
+
+
+def _is_same_session_refresh(
+    state: dict[str, Any], key: str, out_path: Path, new_markdown: str,
+) -> bool:
+    """True only when a raw/ collision is THIS source refreshing its own
+    earlier output, never a clash with a different source (#wiki-sync-errors
+    escalation: ``key in state`` alone is not a strong enough anchor).
+
+    Requires ALL of:
+    1. ``key`` already recorded in ``state`` (this source converted before).
+    2. The existing file has a ``sessionId:`` frontmatter line.
+    3. That id matches the id the fresh render just computed.
+
+    Missing/mismatched ids -- including a file with no frontmatter at
+    all -- fail closed into the ordinary error + quarantine path.
+    """
+    if not _is_resumed_source(state, key):
+        return False
+    try:
+        existing_markdown = out_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    existing_id = _session_id_of(existing_markdown)
+    new_id = _session_id_of(new_markdown)
+    return existing_id is not None and existing_id == new_id
 
 
 def _portable_state_key(adapter_name: str, path: Path) -> str:
@@ -1420,7 +1459,7 @@ def convert_all(
         print("No adapters available. Install Claude Code or Codex CLI first.", file=sys.stderr)
         return 1
 
-    converted = unchanged = live = filtered = ignored_count = errors = 0
+    converted = unchanged = live = filtered = ignored_count = errors = refreshed = 0
 
     # G-03 (#289): per-adapter counters so `llmwiki sync --status` can
     # report which adapter saw what. Written under ``_counters`` in the
@@ -1430,7 +1469,7 @@ def convert_all(
     def _bump(adapter_name: str, field: str) -> None:
         c = counters.setdefault(adapter_name, {
             "discovered": 0, "converted": 0, "unchanged": 0, "live": 0,
-            "filtered": 0, "ignored": 0, "errored": 0,
+            "filtered": 0, "ignored": 0, "errored": 0, "refreshed": 0,
         })
         c[field] = c.get(field, 0) + 1
 
@@ -1448,7 +1487,7 @@ def convert_all(
         print(f"  discovered: {len(sessions)} source files")
         counters.setdefault(cls.name, {
             "discovered": 0, "converted": 0, "unchanged": 0, "live": 0,
-            "filtered": 0, "ignored": 0, "errored": 0,
+            "filtered": 0, "ignored": 0, "errored": 0, "refreshed": 0,
         })
         counters[cls.name]["discovered"] = len(sessions)
         for path in sessions:
@@ -1511,15 +1550,14 @@ def convert_all(
                         _raw_write_guard(out_path, force=force, source=str(path),
                                          adapter_name=cls.name)
                     except FileExistsError as e:
-                        if not _is_resumed_source(state, key):
-                            errors += 1
-                            _bump(cls.name, "errored")
-                            _quarantine_add(cls.name, str(path), str(e))
-                            continue
-                        # This is the same source's own prior raw output, not a
-                        # clash with a different source (#wiki-sync-errors) --
-                        # re-render so appended/resumed content is captured
-                        # instead of being silently dropped forever.
+                        # Markdown-source adapters (Obsidian etc.) have no
+                        # frontmatter session-id anchor to verify a same-source
+                        # refresh against, so every collision here stays an
+                        # unresolved error -- see _session_id_of.
+                        errors += 1
+                        _bump(cls.name, "errored")
+                        _quarantine_add(cls.name, str(path), str(e))
+                        continue
                     out_path.write_text(redact(text), encoding="utf-8")
                     state[key] = mtime
                 converted += 1
@@ -1634,15 +1672,25 @@ def convert_all(
                     _raw_write_guard(out_path, force=force, source=str(path),
                                      adapter_name=cls.name)
                 except FileExistsError as e:
-                    if not _is_resumed_source(state, key):
+                    if not _is_same_session_refresh(state, key, out_path, md):
                         errors += 1
                         _bump(cls.name, "errored")
                         _quarantine_add(cls.name, str(path), str(e))
                         continue
-                    # Same source's own prior raw output, not a clash with a
-                    # different source (#wiki-sync-errors) -- re-render so
-                    # appended/resumed content is captured instead of being
-                    # silently dropped forever.
+                    # Verified same-source refresh (#wiki-sync-errors): the
+                    # existing raw file's own sessionId matches this render,
+                    # so overwrite it with the fuller content instead of
+                    # silently dropping the resumed/appended messages.
+                    shown = (
+                        out_path.relative_to(REPO_ROOT)
+                        if out_path.is_relative_to(REPO_ROOT) else out_path
+                    )
+                    print(f"  refresh: {shown}")
+                    out_path.write_text(md, encoding="utf-8")
+                    state[key] = mtime
+                    refreshed += 1
+                    _bump(cls.name, "refreshed")
+                    continue
                 out_path.write_text(md, encoding="utf-8")
                 state[key] = mtime
             converted += 1
@@ -1672,6 +1720,7 @@ def convert_all(
     print()
     print(
         f"summary: {converted} converted, {unchanged} unchanged, "
-        f"{live} live, {filtered} filtered, {ignored_count} ignored, {errors} errors"
+        f"{live} live, {filtered} filtered, {ignored_count} ignored, "
+        f"{refreshed} refreshed, {errors} errors"
     )
     return 0 if errors == 0 else 1
