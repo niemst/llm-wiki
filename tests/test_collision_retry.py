@@ -62,6 +62,19 @@ def _seed_env(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     return home, project_dir, out_dir, state
 
 
+def _append_message(path: Path, marker: str, iso_ts: str) -> None:
+    """Append one more user/assistant exchange to an existing jsonl,
+    simulating a Claude Code session being reopened and continued.
+    Leaves every earlier line untouched so the session's start time
+    (and therefore its canonical output name) does not change.
+    """
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "type": "user", "timestamp": iso_ts,
+            "message": {"role": "user", "content": marker},
+        }) + "\n")
+
+
 def _touch_and_sync(src: Path, out_dir: Path, state_file: Path, mtime: int) -> int:
     os.utime(src, (mtime, mtime))
     return c.convert_all(adapters=["claude_code"], out_dir=out_dir,
@@ -170,9 +183,11 @@ def test_resync_same_source_is_idempotent(tmp_path, monkeypatch):
     assert first == second, f"re-sync grew the tree: {first} → {second}"
 
 
-def test_resumed_session_stale_disambig_is_skipped_not_errored(tmp_path, monkeypatch):
+def test_resumed_session_overwrites_stale_disambig_with_new_content(tmp_path, monkeypatch):
     """A resumed session whose disambiguated raw file already exists
-    must be skipped, not quarantined as an error, on every later sync.
+    must be RE-CONVERTED with the appended content, not silently
+    skipped -- skipping would freeze the raw file at its stale content
+    while state claims the source is fully captured (silent data loss).
 
     Root cause (wiki-sync-errors): the disambiguator is a stable hash
     of the source PATH, so a source that keeps getting its mtime
@@ -181,7 +196,9 @@ def test_resumed_session_stale_disambig_is_skipped_not_errored(tmp_path, monkeyp
     filename exists, every following sync used to hit
     ``_raw_write_guard`` and quarantine the source as an unresolved
     error forever (production: attempts counts in the hundreds for
-    the same handful of sources).
+    the same handful of sources). The fix must overwrite that file
+    with the fresh render, since it is this same source's own prior
+    output, not a clash with a different source.
     """
     home, proj, out_dir, state_file = _seed_env(tmp_path)
     src = proj / "s.jsonl"
@@ -193,20 +210,27 @@ def test_resumed_session_stale_disambig_is_skipped_not_errored(tmp_path, monkeyp
     first_reopen_sync_rc = _touch_and_sync(src, out_dir, state_file, 2000)
     assert (initial_sync_rc, first_reopen_sync_rc) == (0, 0)
 
-    canonical_and_disambiguated = sorted(p.name for p in out_dir.rglob("*.md"))
+    canonical_and_disambiguated = sorted(out_dir.rglob("*.md"))
     assert len(canonical_and_disambiguated) == 2, canonical_and_disambiguated
+    disambiguated = next(p for p in canonical_and_disambiguated if "--" in p.name)
+    assert "APPENDED-AFTER-RESUME" not in disambiguated.read_text(encoding="utf-8")
 
+    marker = "APPENDED-AFTER-RESUME"
+    _append_message(src, marker, "2026-04-16T10:05:00Z")
     second_reopen_sync_rc = _touch_and_sync(src, out_dir, state_file, 3000)
 
-    after = sorted(p.name for p in out_dir.rglob("*.md"))
-    assert after == canonical_and_disambiguated, (
+    after = sorted(out_dir.rglob("*.md"))
+    assert [p.name for p in after] == [p.name for p in canonical_and_disambiguated], (
         f"must not add or drop files: {canonical_and_disambiguated} -> {after}"
     )
     assert second_reopen_sync_rc == 0, "a resumed session collision must not report as an error"
+    assert marker in disambiguated.read_text(encoding="utf-8"), (
+        "resumed content must land in the raw file, not be dropped"
+    )
 
     counters = json.loads(state_file.read_text())["_counters"]["claude_code"]
     assert counters["errored"] == 0, counters
-    assert counters["skipped"] >= 1, counters
+    assert counters["converted"] == 1, counters
 
 
 def test_genuine_collision_between_two_sources_still_errors(tmp_path, monkeypatch):

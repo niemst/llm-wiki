@@ -1420,7 +1420,7 @@ def convert_all(
         print("No adapters available. Install Claude Code or Codex CLI first.", file=sys.stderr)
         return 1
 
-    converted = unchanged = live = filtered = ignored_count = errors = skipped = 0
+    converted = unchanged = live = filtered = ignored_count = errors = 0
 
     # G-03 (#289): per-adapter counters so `llmwiki sync --status` can
     # report which adapter saw what. Written under ``_counters`` in the
@@ -1430,7 +1430,7 @@ def convert_all(
     def _bump(adapter_name: str, field: str) -> None:
         c = counters.setdefault(adapter_name, {
             "discovered": 0, "converted": 0, "unchanged": 0, "live": 0,
-            "filtered": 0, "ignored": 0, "errored": 0, "skipped": 0,
+            "filtered": 0, "ignored": 0, "errored": 0,
         })
         c[field] = c.get(field, 0) + 1
 
@@ -1448,7 +1448,7 @@ def convert_all(
         print(f"  discovered: {len(sessions)} source files")
         counters.setdefault(cls.name, {
             "discovered": 0, "converted": 0, "unchanged": 0, "live": 0,
-            "filtered": 0, "ignored": 0, "errored": 0, "skipped": 0,
+            "filtered": 0, "ignored": 0, "errored": 0,
         })
         counters[cls.name]["discovered"] = len(sessions)
         for path in sessions:
@@ -1511,16 +1511,15 @@ def convert_all(
                         _raw_write_guard(out_path, force=force, source=str(path),
                                          adapter_name=cls.name)
                     except FileExistsError as e:
-                        if _is_resumed_source(state, key):
-                            state[key] = mtime
-                            skipped += 1
-                            _bump(cls.name, "skipped")
-                            print(f"  skip: {path.name}: already converted from this source; raw/ is immutable")
-                        else:
+                        if not _is_resumed_source(state, key):
                             errors += 1
                             _bump(cls.name, "errored")
                             _quarantine_add(cls.name, str(path), str(e))
-                        continue
+                            continue
+                        # This is the same source's own prior raw output, not a
+                        # clash with a different source (#wiki-sync-errors) --
+                        # re-render so appended/resumed content is captured
+                        # instead of being silently dropped forever.
                     out_path.write_text(redact(text), encoding="utf-8")
                     state[key] = mtime
                 converted += 1
@@ -1635,16 +1634,15 @@ def convert_all(
                     _raw_write_guard(out_path, force=force, source=str(path),
                                      adapter_name=cls.name)
                 except FileExistsError as e:
-                    if _is_resumed_source(state, key):
-                        state[key] = mtime
-                        skipped += 1
-                        _bump(cls.name, "skipped")
-                        print(f"  skip: {path.name}: already converted from this source; raw/ is immutable")
-                    else:
+                    if not _is_resumed_source(state, key):
                         errors += 1
                         _bump(cls.name, "errored")
                         _quarantine_add(cls.name, str(path), str(e))
-                    continue
+                        continue
+                    # Same source's own prior raw output, not a clash with a
+                    # different source (#wiki-sync-errors) -- re-render so
+                    # appended/resumed content is captured instead of being
+                    # silently dropped forever.
                 out_path.write_text(md, encoding="utf-8")
                 state[key] = mtime
             converted += 1
@@ -1674,7 +1672,6 @@ def convert_all(
     print()
     print(
         f"summary: {converted} converted, {unchanged} unchanged, "
-        f"{live} live, {filtered} filtered, {ignored_count} ignored, "
-        f"{skipped} skipped, {errors} errors"
+        f"{live} live, {filtered} filtered, {ignored_count} ignored, {errors} errors"
     )
     return 0 if errors == 0 else 1
