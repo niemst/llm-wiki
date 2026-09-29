@@ -10,6 +10,7 @@ getting quarantined.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -61,6 +62,12 @@ def _seed_env(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     return home, project_dir, out_dir, state
 
 
+def _touch_and_sync(src: Path, out_dir: Path, state_file: Path, mtime: int) -> int:
+    os.utime(src, (mtime, mtime))
+    return c.convert_all(adapters=["claude_code"], out_dir=out_dir,
+                          state_file=state_file, include_current=True)
+
+
 def _patch(monkeypatch, home, out_dir, state):
     # ClaudeCodeAdapter.session_store_path is a class-level attribute
     # evaluated at class-definition time, so we have to patch the class
@@ -75,6 +82,8 @@ def _patch(monkeypatch, home, out_dir, state):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setattr(c, "DEFAULT_STATE_FILE", state)
     monkeypatch.setattr(c, "REPO_ROOT", home.parent / "repo")
+    from llmwiki import quarantine as q
+    monkeypatch.setattr(q, "DEFAULT_QUARANTINE_FILE", home.parent / "quarantine.json")
 
 
 def test_subagent_collision_is_resolved_with_hash_suffix(tmp_path, monkeypatch):
@@ -159,6 +168,81 @@ def test_resync_same_source_is_idempotent(tmp_path, monkeypatch):
                   state_file=state, include_current=True)
     second = sorted(out_dir.rglob("*.md"))
     assert first == second, f"re-sync grew the tree: {first} → {second}"
+
+
+def test_resumed_session_stale_disambig_is_skipped_not_errored(tmp_path, monkeypatch):
+    """A resumed session whose disambiguated raw file already exists
+    must be skipped, not quarantined as an error, on every later sync.
+
+    Root cause (wiki-sync-errors): the disambiguator is a stable hash
+    of the source PATH, so a source that keeps getting its mtime
+    bumped (a Claude Code session reopened and appended to) computes
+    the SAME disambiguated filename on every later sync. Once that
+    filename exists, every following sync used to hit
+    ``_raw_write_guard`` and quarantine the source as an unresolved
+    error forever (production: attempts counts in the hundreds for
+    the same handful of sources).
+    """
+    home, proj, out_dir, state_file = _seed_env(tmp_path)
+    src = proj / "s.jsonl"
+    _write_jsonl(src, "resumed-session", "2026-04-16T10:00:00Z")
+    _patch(monkeypatch, home, out_dir, state_file)
+    c.discover_adapters()
+
+    initial_sync_rc = _touch_and_sync(src, out_dir, state_file, 1000)
+    first_reopen_sync_rc = _touch_and_sync(src, out_dir, state_file, 2000)
+    assert (initial_sync_rc, first_reopen_sync_rc) == (0, 0)
+
+    canonical_and_disambiguated = sorted(p.name for p in out_dir.rglob("*.md"))
+    assert len(canonical_and_disambiguated) == 2, canonical_and_disambiguated
+
+    second_reopen_sync_rc = _touch_and_sync(src, out_dir, state_file, 3000)
+
+    after = sorted(p.name for p in out_dir.rglob("*.md"))
+    assert after == canonical_and_disambiguated, (
+        f"must not add or drop files: {canonical_and_disambiguated} -> {after}"
+    )
+    assert second_reopen_sync_rc == 0, "a resumed session collision must not report as an error"
+
+    counters = json.loads(state_file.read_text())["_counters"]["claude_code"]
+    assert counters["errored"] == 0, counters
+    assert counters["skipped"] >= 1, counters
+
+
+def test_genuine_collision_between_two_sources_still_errors(tmp_path, monkeypatch):
+    """A real collision — two DIFFERENT sources whose disambiguated
+    names collide — must still be quarantined as an error. The
+    resumed-session fix must not silence real, unresolved clashes.
+    """
+    home, proj, out_dir, state_file = _seed_env(tmp_path)
+    a = proj / "a.jsonl"
+    b = proj / "b.jsonl"
+    _write_jsonl(a, "sess-a", "2026-04-16T10:00:00Z", slug="dup")
+    _write_jsonl(b, "sess-b", "2026-04-16T10:00:00Z", slug="dup")
+    _patch(monkeypatch, home, out_dir, state_file)
+    c.discover_adapters()
+
+    c.convert_all(adapters=["claude_code"], out_dir=out_dir,
+                  state_file=state_file, include_current=True)
+    before = sorted(p.name for p in out_dir.rglob("*.md"))
+    assert len(before) == 2, before  # one canonical, one disambiguated
+
+    # Manually recreate the exact FileExistsError this test guards
+    # against: delete state's memory of `b` so its key is no longer
+    # recorded, then force a re-attempt at the SAME disambiguated
+    # name a fresh, unrelated source would also land on.
+    state = json.loads(state_file.read_text())
+    b_key = next(k for k in state if k.endswith("b.jsonl"))
+    del state[b_key]
+    state_file.write_text(json.dumps(state))
+    os.utime(b, (5000, 5000))
+
+    rc = c.convert_all(adapters=["claude_code"], out_dir=out_dir,
+                        state_file=state_file, include_current=True)
+
+    counters = json.loads(state_file.read_text())["_counters"]["claude_code"]
+    assert counters["errored"] >= 1, counters
+    assert rc == 1
 
 
 def test_force_sync_does_not_drop_colliding_sources(tmp_path, monkeypatch):

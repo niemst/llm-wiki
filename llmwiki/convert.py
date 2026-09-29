@@ -144,6 +144,27 @@ def _raw_write_guard(
     )
 
 
+def _is_resumed_source(state: dict[str, Any], key: str) -> bool:
+    """True when ``key`` already has a recorded mtime in ``state``.
+
+    A ``FileExistsError`` from ``_raw_write_guard`` means the output
+    name we just computed for THIS source already exists on disk.
+    Two distinct causes look identical at that point:
+
+    1. This exact source converted successfully before, and its
+       mtime moved because a resumed/appended CLI session touched the
+       file again (raw/ never rewrites, so every later sync re-hits
+       the same guard forever -- see #wiki-sync-errors).
+    2. A genuinely different source collided on the same output name.
+
+    ``state[key]`` only ever gets set right after a successful write
+    of THIS source (see the ``state[key] = mtime`` calls below), so
+    its presence disambiguates case 1 from case 2 without needing to
+    read the existing output file back off disk.
+    """
+    return key in state
+
+
 def _portable_state_key(adapter_name: str, path: Path) -> str:
     """Return a portable state-file key for ``path`` (G-04 · #290).
 
@@ -1399,7 +1420,7 @@ def convert_all(
         print("No adapters available. Install Claude Code or Codex CLI first.", file=sys.stderr)
         return 1
 
-    converted = unchanged = live = filtered = ignored_count = errors = 0
+    converted = unchanged = live = filtered = ignored_count = errors = skipped = 0
 
     # G-03 (#289): per-adapter counters so `llmwiki sync --status` can
     # report which adapter saw what. Written under ``_counters`` in the
@@ -1409,7 +1430,7 @@ def convert_all(
     def _bump(adapter_name: str, field: str) -> None:
         c = counters.setdefault(adapter_name, {
             "discovered": 0, "converted": 0, "unchanged": 0, "live": 0,
-            "filtered": 0, "ignored": 0, "errored": 0,
+            "filtered": 0, "ignored": 0, "errored": 0, "skipped": 0,
         })
         c[field] = c.get(field, 0) + 1
 
@@ -1427,7 +1448,7 @@ def convert_all(
         print(f"  discovered: {len(sessions)} source files")
         counters.setdefault(cls.name, {
             "discovered": 0, "converted": 0, "unchanged": 0, "live": 0,
-            "filtered": 0, "ignored": 0, "errored": 0,
+            "filtered": 0, "ignored": 0, "errored": 0, "skipped": 0,
         })
         counters[cls.name]["discovered"] = len(sessions)
         for path in sessions:
@@ -1490,9 +1511,15 @@ def convert_all(
                         _raw_write_guard(out_path, force=force, source=str(path),
                                          adapter_name=cls.name)
                     except FileExistsError as e:
-                        errors += 1
-                        _bump(cls.name, "errored")
-                        _quarantine_add(cls.name, str(path), str(e))
+                        if _is_resumed_source(state, key):
+                            state[key] = mtime
+                            skipped += 1
+                            _bump(cls.name, "skipped")
+                            print(f"  skip: {path.name}: already converted from this source; raw/ is immutable")
+                        else:
+                            errors += 1
+                            _bump(cls.name, "errored")
+                            _quarantine_add(cls.name, str(path), str(e))
                         continue
                     out_path.write_text(redact(text), encoding="utf-8")
                     state[key] = mtime
@@ -1608,9 +1635,15 @@ def convert_all(
                     _raw_write_guard(out_path, force=force, source=str(path),
                                      adapter_name=cls.name)
                 except FileExistsError as e:
-                    errors += 1
-                    _bump(cls.name, "errored")
-                    _quarantine_add(cls.name, str(path), str(e))
+                    if _is_resumed_source(state, key):
+                        state[key] = mtime
+                        skipped += 1
+                        _bump(cls.name, "skipped")
+                        print(f"  skip: {path.name}: already converted from this source; raw/ is immutable")
+                    else:
+                        errors += 1
+                        _bump(cls.name, "errored")
+                        _quarantine_add(cls.name, str(path), str(e))
                     continue
                 out_path.write_text(md, encoding="utf-8")
                 state[key] = mtime
@@ -1641,6 +1674,7 @@ def convert_all(
     print()
     print(
         f"summary: {converted} converted, {unchanged} unchanged, "
-        f"{live} live, {filtered} filtered, {ignored_count} ignored, {errors} errors"
+        f"{live} live, {filtered} filtered, {ignored_count} ignored, "
+        f"{skipped} skipped, {errors} errors"
     )
     return 0 if errors == 0 else 1
