@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import html
 import json
 import os
@@ -2338,6 +2339,31 @@ def build_site(
     claude_path: str = "",
     search_mode: str = "auto",
     seed_project_stubs: bool = False,
+) -> int:
+    """Build the site, one build per ``out_dir`` at a time (#wiki-sync-errors).
+
+    Two builds in the same ``out_dir`` delete each other's files in the
+    reset step, and the later one fails with rmtree ENOTEMPTY. A second
+    build skips instead of waiting: the running build renders the site,
+    and the next sync builds again.
+    """
+    lock_path = out_dir.with_name(out_dir.name + ".build.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as lock_handle:
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"  site build already running for {out_dir}; skipped")
+            return 0
+        return _build_site_unlocked(out_dir, synthesize, claude_path, search_mode, seed_project_stubs)
+
+
+def _build_site_unlocked(
+    out_dir: Path,
+    synthesize: bool,
+    claude_path: str,
+    search_mode: str,
+    seed_project_stubs: bool,
 ) -> int:
     if not RAW_SESSIONS.exists():
         print(
