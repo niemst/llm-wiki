@@ -14,8 +14,10 @@ import fnmatch as _fnmatch  # #py-m11 (#597): module-level alias
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1442,6 +1444,22 @@ def _persist_run_state(state_file: Path, state: dict[str, Any],
     save_state(state_file, state)
 
 
+_stop_requested = False
+
+
+def _handle_sigterm(signum: int, frame: Any) -> None:
+    """Record the request; never raise (#wiki-sync-errors).
+
+    Raising here could land between an ``out_path.write_text(...)`` and its
+    matching ``state[key] = mtime`` and recreate the bug this fix closes.
+    ``_convert_all_with_state`` polls this flag instead and stops at the
+    next source boundary, where the write and the state update are already
+    paired.
+    """
+    global _stop_requested
+    _stop_requested = True
+
+
 def convert_all(
     adapters: list[str] | None = None,
     out_dir: Path = DEFAULT_OUT_DIR,
@@ -1458,19 +1476,32 @@ def convert_all(
 
     The state is saved in ``finally``: a run that raises after it wrote raw
     files still records their keys, so those sources are not refused later.
+    A SIGTERM (e.g. the MCP server giving up on a hung child) is handled the
+    same way: ``_convert_all_with_state`` stops at the next source boundary
+    instead of being killed mid-write.
     """
-    with _exclusive_sync_lock(state_file):
-        state = {} if force else load_state(state_file, adapter_names=list(REGISTRY.keys()))
-        counters: dict[str, dict[str, int]] = {}
-        try:
-            return _convert_all_with_state(
-                state, counters, adapters=adapters, out_dir=out_dir, config_file=config_file,
-                ignore_file=ignore_file, since=since, project=project,
-                include_current=include_current, force=force, dry_run=dry_run,
-            )
-        finally:
-            if not dry_run:
-                _persist_run_state(state_file, state, counters)
+    global _stop_requested
+    _stop_requested = False
+    is_main_thread = threading.current_thread() is threading.main_thread()
+    previous_handler = signal.getsignal(signal.SIGTERM) if is_main_thread else None
+    if is_main_thread:
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+    try:
+        with _exclusive_sync_lock(state_file):
+            state = {} if force else load_state(state_file, adapter_names=list(REGISTRY.keys()))
+            counters: dict[str, dict[str, int]] = {}
+            try:
+                return _convert_all_with_state(
+                    state, counters, adapters=adapters, out_dir=out_dir, config_file=config_file,
+                    ignore_file=ignore_file, since=since, project=project,
+                    include_current=include_current, force=force, dry_run=dry_run,
+                )
+            finally:
+                if not dry_run:
+                    _persist_run_state(state_file, state, counters)
+    finally:
+        if is_main_thread and previous_handler is not None:
+            signal.signal(signal.SIGTERM, previous_handler)
 
 
 def _convert_all_with_state(
@@ -1554,8 +1585,12 @@ def _convert_all_with_state(
     # set, `sync --force` silently overwrote colliding outputs because the
     # disambiguator on disk was gated on ``not force`` (bug #339).
     names_written_this_run: set[str] = set()
+    stopped_early = False
 
     for cls in selected:
+        if _stop_requested:
+            stopped_early = True
+            break
         adapter = cls(config)
         print(f"==> adapter: {cls.name}")
         sessions = adapter.discover_sessions()
@@ -1566,6 +1601,9 @@ def _convert_all_with_state(
         })
         counters[cls.name]["discovered"] = len(sessions)
         for path in sessions:
+            if _stop_requested:
+                stopped_early = True
+                break
             # #arch-h9 (#612): mtime check FIRST. The previous order
             # called `adapter.derive_project_slug(path)` before the
             # mtime check, which on Codex CLI opens every .jsonl to
@@ -1771,6 +1809,11 @@ def _convert_all_with_state(
             converted += 1
             _bump(cls.name, "converted")
 
+        if stopped_early:
+            break
+
+    if stopped_early:
+        print("stopped early on SIGTERM; state saved")
     print()
     print(
         f"summary: {converted} converted, {unchanged} unchanged, "
