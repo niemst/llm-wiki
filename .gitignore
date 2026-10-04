@@ -69,6 +69,8 @@ dist-site/
 # Converter state — tracks mtimes to avoid re-processing unchanged files.
 .ingestion-state.json
 .llmwiki-state.json
+.llmwiki-state.json.lock
+site.build.lock
 .llmwiki-synth-state.json
 .llmwiki-queue.json
 .llmwiki-dream-state.json
