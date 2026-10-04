@@ -23,6 +23,7 @@ Ships as stdlib-only Python — no MCP SDK dependency.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -684,6 +685,21 @@ def tool_wiki_sync(args: dict[str, Any]) -> dict[str, Any]:
     # Stream stdout via Popen + readline, capping the captured tail
     # to a fixed byte budget so the MCP response stays bounded.
     OUTPUT_CAP_BYTES = 256 * 1024  # 256 KB tail in the response
+    # #wiki-sync-errors: give the child time to hit a source boundary and
+    # save state (.llmwiki-state.json is ~13 MB; one source can be a large
+    # transcript) before escalating to SIGKILL.
+    GRACE_SECONDS = 30.0
+
+    def _append(chunk: str) -> bool:
+        nonlocal captured_bytes
+        if not chunk:
+            return False
+        if captured_bytes < OUTPUT_CAP_BYTES:
+            captured.append(chunk)
+            captured_bytes += len(chunk)
+            return False
+        return True
+
     captured: list[str] = []
     captured_bytes = 0
     truncated = False
@@ -694,21 +710,43 @@ def tool_wiki_sync(args: dict[str, Any]) -> dict[str, Any]:
             stderr=subprocess.STDOUT,
             text=True,
             cwd=str(REPO_ROOT),
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
         # Read line-by-line so a hung child doesn't block forever — the
         # outer try wraps a 120s timeout via proc.wait below.
         assert proc.stdout is not None
         deadline = time.time() + 120.0
+        hit_deadline = False
         for line in proc.stdout:
-            if captured_bytes < OUTPUT_CAP_BYTES:
-                captured.append(line)
-                captured_bytes += len(line)
-            else:
-                truncated = True
+            truncated = _append(line) or truncated
             if time.time() > deadline:
-                proc.kill()
-                return _err("sync timed out after 120s")
-        proc.wait(timeout=max(0.1, deadline - time.time()))
+                hit_deadline = True
+                break
+        if hit_deadline:
+            if proc.poll() is not None:
+                # Child already finished; the converter doesn't flush
+                # stdout, so output can arrive in one late block that
+                # lands after our deadline check (false timeout).
+                for line in proc.stdout:
+                    truncated = _append(line) or truncated
+            else:
+                proc.terminate()
+                try:
+                    remainder, _ = proc.communicate(timeout=GRACE_SECONDS)
+                    message = "sync stopped after 120s; progress saved, run again to continue"
+                except subprocess.TimeoutExpired:
+                    # Child ignored SIGTERM; a real SIGKILL may land
+                    # mid-write, so do not claim progress was saved.
+                    proc.kill()
+                    remainder, _ = proc.communicate()
+                    message = "sync killed after 120s + 30s grace; run again to continue"
+                truncated = _append(remainder) or truncated
+                output = "".join(captured)
+                if truncated:
+                    output += f"\n[output truncated at {OUTPUT_CAP_BYTES // 1024} KB]"
+                return _err(f"{message}\n{output}" if output else message)
+        else:
+            proc.wait(timeout=max(0.1, deadline - time.time()))
     except subprocess.TimeoutExpired:
         try: proc.kill()  # type: ignore[name-defined]
         except Exception: pass
