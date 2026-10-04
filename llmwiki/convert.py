@@ -9,13 +9,17 @@ mtime, so re-running on unchanged files is a fast no-op.
 
 from __future__ import annotations
 
+import fcntl
 import fnmatch as _fnmatch  # #py-m11 (#597): module-level alias
 import json
+import os
 import re
 import sys
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 from llmwiki import REPO_ROOT
 from llmwiki.adapters import REGISTRY, discover_adapters
@@ -332,7 +336,16 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     # `dict[str, float]` annotation lied to type-checkers and to the
     # multi-agent review that flagged it.
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    # A kill mid-write must not leave a truncated state file: write a
+    # sibling temp file, then rename it over the state (atomic on POSIX).
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            tmp.write(json.dumps(state, indent=2, sort_keys=True))
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
 
 
 # ─── .llmwikiignore ───────────────────────────────────────────────────────
@@ -1392,6 +1405,43 @@ def render_session_markdown(
 
 # ─── orchestration ─────────────────────────────────────────────────────────
 
+@contextmanager
+def _exclusive_sync_lock(state_file: Path) -> Iterator[None]:
+    """Serialise sync runs on one state file.
+
+    Each run loads the whole state at its start and rewrites it at its end.
+    Two overlapping runs therefore lose each other's ``state[key]`` updates:
+    the raw file exists but its source has no key, so ``_raw_write_guard``
+    refuses that source on every later run (#wiki-sync-errors). The lock is
+    blocking: a second run waits, then loads the state the first run saved.
+    """
+    lock_path = state_file.with_name(state_file.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as lock_handle:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_handle, fcntl.LOCK_UN)
+
+
+def _persist_run_state(state_file: Path, state: dict[str, Any],
+                       counters: dict[str, dict[str, int]]) -> None:
+    """Stamp ``_meta.last_sync`` + ``_counters`` and save the state.
+
+    G-03 (#289): ``llmwiki sync --status`` reads these keys. Keys are
+    namespaced with ``_`` so they cannot collide with portable
+    ``adapter::path`` keys. #426: this also runs under ``--force``, which
+    ignores *prior* state but must still record the new run.
+    """
+    state["_meta"] = {
+        "last_sync": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "version": 1,
+    }
+    state["_counters"] = counters
+    save_state(state_file, state)
+
+
 def convert_all(
     adapters: list[str] | None = None,
     out_dir: Path = DEFAULT_OUT_DIR,
@@ -1404,9 +1454,39 @@ def convert_all(
     force: bool = False,
     dry_run: bool = False,
 ) -> int:
-    """Main entry: convert new sessions across all enabled adapters."""
+    """Main entry: convert new sessions across all enabled adapters.
+
+    The state is saved in ``finally``: a run that raises after it wrote raw
+    files still records their keys, so those sources are not refused later.
+    """
+    with _exclusive_sync_lock(state_file):
+        state = {} if force else load_state(state_file, adapter_names=list(REGISTRY.keys()))
+        counters: dict[str, dict[str, int]] = {}
+        try:
+            return _convert_all_with_state(
+                state, counters, adapters=adapters, out_dir=out_dir, config_file=config_file,
+                ignore_file=ignore_file, since=since, project=project,
+                include_current=include_current, force=force, dry_run=dry_run,
+            )
+        finally:
+            if not dry_run:
+                _persist_run_state(state_file, state, counters)
+
+
+def _convert_all_with_state(
+    state: dict[str, Any],
+    counters: dict[str, dict[str, int]],
+    adapters: list[str] | None,
+    out_dir: Path,
+    config_file: Path,
+    ignore_file: Path,
+    since: Optional[str],
+    project: Optional[str],
+    include_current: bool,
+    force: bool,
+    dry_run: bool,
+) -> int:
     config = load_config(config_file)
-    state = {} if force else load_state(state_file, adapter_names=list(REGISTRY.keys()))
     redact = Redactor(config)
     ignore = IgnoreMatcher.from_file(ignore_file)
     if ignore:
@@ -1460,11 +1540,6 @@ def convert_all(
         return 1
 
     converted = unchanged = live = filtered = ignored_count = errors = refreshed = 0
-
-    # G-03 (#289): per-adapter counters so `llmwiki sync --status` can
-    # report which adapter saw what. Written under ``_counters`` in the
-    # state file so there's no separate persistence surface to maintain.
-    counters: dict[str, dict[str, int]] = {}
 
     def _bump(adapter_name: str, field: str) -> None:
         c = counters.setdefault(adapter_name, {
@@ -1695,27 +1770,6 @@ def convert_all(
                 state[key] = mtime
             converted += 1
             _bump(cls.name, "converted")
-
-    if not dry_run:
-        # G-03 (#289): stamp _meta.last_sync + _counters onto the state
-        # file so `llmwiki sync --status` has a canonical place to read
-        # observability data. Keys are namespaced with `_` so they can't
-        # collide with portable adapter::path keys (which never start
-        # with `_` because adapter names are lowercase identifiers).
-        # #426: persist under --force too. `--force` is meant to ignore
-        # *prior* state (re-process files even when their mtime says
-        # they're unchanged), not to skip recording the new run. The
-        # original `not force` guard discarded every per-key state
-        # update from this run plus the observability data, so
-        # `sync --status` after a `--force` re-sync would silently show
-        # the *previous* run's `last_sync` timestamp, and the next
-        # non-force sync would re-process every file all over again.
-        state["_meta"] = {
-            "last_sync": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "version": 1,
-        }
-        state["_counters"] = counters
-        save_state(state_file, state)
 
     print()
     print(
