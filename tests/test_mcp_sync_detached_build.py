@@ -54,6 +54,7 @@ def test_live_sync_skips_inline_build_and_starts_detached_build(calls):
     assert sync_cmd[-2:] == ["sync", "--no-auto-build"]
     assert build_cmd[-2:] == ["build", "--seed-project-stubs"]
     assert started[1][1]["start_new_session"] is True
+    assert started[1][1]["env"]["PYTHONUNBUFFERED"] == "1"
     assert "site build started in background" in result["content"][0]["text"]
 
 
