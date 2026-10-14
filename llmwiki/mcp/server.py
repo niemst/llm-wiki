@@ -741,6 +741,7 @@ def _start_detached_site_build() -> str:
             subprocess.Popen(
                 [sys.executable, "-m", "llmwiki", "build", "--seed-project-stubs"],
                 cwd=str(REPO_ROOT),
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
