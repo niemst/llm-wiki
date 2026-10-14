@@ -676,8 +676,9 @@ def tool_wiki_sync(args: dict[str, Any]) -> dict[str, Any]:
         # dry-run + tell them why. Better than silently mutating raw/.
         dry_run = True
     cmd = [sys.executable, "-m", "llmwiki", "sync"]
-    if dry_run:
-        cmd.append("--dry-run")
+    # A full site build reads every raw session and takes longer than the
+    # 120s MCP budget. The call converts only; the build runs detached.
+    cmd.append("--dry-run" if dry_run else "--no-auto-build")
     # #py-h1 (#582): capture_output=True buffers all stdout in RAM. A
     # very chatty sync (thousands of sessions) can blow past the
     # 1 GB-ish ceiling Python can hold + grow before OOM-killing.
@@ -718,7 +719,36 @@ def tool_wiki_sync(args: dict[str, Any]) -> dict[str, Any]:
     output = "".join(captured)
     if truncated:
         output += f"\n[output truncated at {OUTPUT_CAP_BYTES // 1024} KB]"
+    if not dry_run and proc.returncode == 0:
+        output += _start_detached_site_build()
     return _ok(output or "(no output)")
+
+
+SITE_BUILD_LOG = REPO_ROOT / "site.build.log"
+SITE_BUILD_LOG_MAX_BYTES = 1024 * 1024
+
+
+def _start_detached_site_build() -> str:
+    """Start the after-sync site build outside the MCP call. The build
+    lock skips this build when another build already runs."""
+    from llmwiki.config_schedule import load_schedule_config, should_run_after_sync
+
+    if not should_run_after_sync(load_schedule_config()["build"]):
+        return ""
+    try:
+        oversized = SITE_BUILD_LOG.is_file() and SITE_BUILD_LOG.stat().st_size > SITE_BUILD_LOG_MAX_BYTES
+        with SITE_BUILD_LOG.open("wb" if oversized else "ab") as log:
+            subprocess.Popen(
+                [sys.executable, "-m", "llmwiki", "build", "--seed-project-stubs"],
+                cwd=str(REPO_ROOT),
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError as e:
+        return f"\n  site build not started: {e}"
+    return f"\n  site build started in background; log: {SITE_BUILD_LOG}"
 
 
 def tool_wiki_export(args: dict[str, Any]) -> dict[str, Any]:
