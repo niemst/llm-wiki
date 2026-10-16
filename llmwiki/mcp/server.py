@@ -676,10 +676,9 @@ def tool_wiki_sync(args: dict[str, Any]) -> dict[str, Any]:
         # Caller asked for live sync without confirmation — downgrade to
         # dry-run + tell them why. Better than silently mutating raw/.
         dry_run = True
-    cmd = [sys.executable, "-m", "llmwiki", "sync"]
-    # A full site build reads every raw session and takes longer than the
-    # 120s MCP budget. The call converts only; the build runs detached.
-    cmd.append("--dry-run" if dry_run else "--no-auto-build")
+    cmd = [sys.executable, "-m", "llmwiki", "mcp-sync"]
+    if dry_run:
+        cmd.append("--dry-run")
     # #py-h1 (#582): capture_output=True buffers all stdout in RAM. A
     # very chatty sync (thousands of sessions) can blow past the
     # 1 GB-ish ceiling Python can hold + grow before OOM-killing.
@@ -757,37 +756,11 @@ def tool_wiki_sync(args: dict[str, Any]) -> dict[str, Any]:
     output = "".join(captured)
     if truncated:
         output += f"\n[output truncated at {OUTPUT_CAP_BYTES // 1024} KB]"
-    if not dry_run and proc.returncode == 0:
-        output += _start_detached_site_build()
-    return _ok(output or "(no output)")
-
-
-SITE_BUILD_LOG = REPO_ROOT / "site.build.log"
-SITE_BUILD_LOG_MAX_BYTES = 1024 * 1024
-
-
-def _start_detached_site_build() -> str:
-    """Start the after-sync site build outside the MCP call. The build
-    lock skips this build when another build already runs."""
-    from llmwiki.config_schedule import load_schedule_config, should_run_after_sync
-
-    if not should_run_after_sync(load_schedule_config()["build"]):
-        return ""
-    try:
-        oversized = SITE_BUILD_LOG.is_file() and SITE_BUILD_LOG.stat().st_size > SITE_BUILD_LOG_MAX_BYTES
-        with SITE_BUILD_LOG.open("wb" if oversized else "ab") as log:
-            subprocess.Popen(
-                [sys.executable, "-m", "llmwiki", "build", "--seed-project-stubs"],
-                cwd=str(REPO_ROOT),
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-    except OSError as e:
-        return f"\n  site build not started: {e}"
-    return f"\n  site build started in background; log: {SITE_BUILD_LOG}"
+    if proc.returncode == 0:
+        return _ok(output or "(no output)")
+    if proc.returncode == 1:
+        return _ok(f"sync finished with per-file errors; site build skipped\n{output}")
+    return _err(f"sync exited with code {proc.returncode}\n{output}")
 
 
 def tool_wiki_export(args: dict[str, Any]) -> dict[str, Any]:
@@ -1061,9 +1034,14 @@ def handle_tools_call(params: dict[str, Any]) -> dict[str, Any]:
     if impl is None:
         return _err(f"Unknown tool: {name}")
     try:
-        return impl(args)
+        result = impl(args)
     except Exception as e:
-        return _err(f"Internal error in {name}: {e}")
+        result = _err(f"Internal error in {name}: {e}")
+    note = _stale_code_note()
+    content = result.get("content")
+    if note and isinstance(content, list):
+        content.append({"type": "text", "text": note})
+    return result
 
 
 HANDLERS = {
@@ -1071,6 +1049,43 @@ HANDLERS = {
     "tools/list": handle_tools_list,
     "tools/call": handle_tools_call,
 }
+
+
+CODE_ROOT = Path(__file__).resolve().parent.parent
+STALE_CODE_CHECK_INTERVAL_S = 60.0
+STALE_CODE_NOTE = (
+    "note: brain MCP server code changed on disk since this server started; "
+    "run /mcp and reconnect brain to load it"
+)
+_started_code_signature: tuple[int, float] = (0, 0.0)
+_last_stale_check = float("-inf")
+_code_changed = False
+
+
+def _code_signature() -> tuple[int, float]:
+    mtimes = []
+    for path in CODE_ROOT.rglob("*.py"):
+        try:
+            mtimes.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    return (len(mtimes), max(mtimes, default=0.0))
+
+
+def _init_code_watch() -> None:
+    global _started_code_signature, _last_stale_check, _code_changed
+    _started_code_signature = _code_signature()
+    _last_stale_check = float("-inf")
+    _code_changed = False
+
+
+def _stale_code_note() -> str:
+    global _last_stale_check, _code_changed
+    now = time.monotonic()
+    if not _code_changed and now - _last_stale_check >= STALE_CODE_CHECK_INTERVAL_S:
+        _last_stale_check = now
+        _code_changed = _code_signature() != _started_code_signature
+    return STALE_CODE_NOTE if _code_changed else ""
 
 
 def send(message: dict[str, Any]) -> None:
@@ -1088,6 +1103,7 @@ def error_response(req_id: Any, code: int, message: str) -> dict[str, Any]:
 
 def main() -> int:
     """Run the MCP server on stdin/stdout."""
+    _init_code_watch()
     try:
         for line in sys.stdin:
             line = line.strip()
