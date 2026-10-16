@@ -106,6 +106,19 @@ python3 -m llmwiki sync --force
 
 ---
 
+## `mcp-sync` — the MCP `wiki_sync` policy
+
+Run by the MCP `wiki_sync` tool in a fresh process per call. Converts with
+`sync --no-auto-build` (or `sync --dry-run`), then starts the site build
+detached on a successful live run. Use `--dry-run` to list what would convert.
+
+```bash
+llmwiki mcp-sync --dry-run
+llmwiki mcp-sync
+```
+
+---
+
 ## `build` — compile the static HTML site
 
 Turns `wiki/` markdown into `site/` HTML.

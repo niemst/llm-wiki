@@ -21,6 +21,8 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -203,6 +205,42 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 # _load_schedule_config + _should_run_after_sync moved to
 # llmwiki/config_schedule.py and re-exported at top of file (#691).
+
+
+SITE_BUILD_LOG = REPO_ROOT / "site.build.log"
+SITE_BUILD_LOG_MAX_BYTES = 1024 * 1024
+
+
+def cmd_mcp_sync(args: argparse.Namespace) -> int:
+    """wiki_sync policy for the MCP shim. The shim starts this in a fresh
+    process per call, so code changes on disk apply without restarting the
+    long-lived MCP server."""
+    rc = main(["sync", "--dry-run" if args.dry_run else "--no-auto-build"])
+    if rc == 0 and not args.dry_run:
+        sys.stdout.write(_start_detached_site_build())
+    return rc
+
+
+def _start_detached_site_build() -> str:
+    """Start the after-sync site build outside the MCP call. The build
+    lock skips this build when another build already runs."""
+    if not _should_run_after_sync(_load_schedule_config()["build"]):
+        return ""
+    try:
+        oversized = SITE_BUILD_LOG.is_file() and SITE_BUILD_LOG.stat().st_size > SITE_BUILD_LOG_MAX_BYTES
+        with SITE_BUILD_LOG.open("wb" if oversized else "ab") as log:
+            subprocess.Popen(
+                [sys.executable, "-m", "llmwiki", "build", "--seed-project-stubs"],
+                cwd=str(REPO_ROOT),
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError as e:
+        return f"\n  site build not started: {e}"
+    return f"\n  site build started in background; log: {SITE_BUILD_LOG}"
 
 
 def cmd_build(args: argparse.Namespace) -> int:
@@ -732,6 +770,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --status: also show last N recent log entries.",
     )
     sync.set_defaults(func=cmd_sync)
+
+    mcp_sync = sub.add_parser(
+        "mcp-sync", help="wiki_sync MCP policy: convert, then start the site build detached",
+    )
+    mcp_sync.add_argument("--dry-run", action="store_true")
+    mcp_sync.set_defaults(func=cmd_mcp_sync)
 
     # build
     build = sub.add_parser("build", help="Compile static HTML site from raw/ + wiki/")

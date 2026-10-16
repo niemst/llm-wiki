@@ -54,3 +54,31 @@ def test_false_timeout_drains_finished_child(monkeypatch) -> None:
     assert result["isError"] is False
     assert "timed out" not in result["content"][0]["text"]
     assert "converted" in result["content"][0]["text"]
+
+
+class _FakeRunningProc:
+    def __init__(self) -> None:
+        self.stdout = _FakeStdout(["converting...\n"])
+        self.terminated = False
+
+    def poll(self) -> None:
+        return None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def communicate(self, timeout: float | None = None):
+        return "", None
+
+
+def test_deadline_stops_child_and_reports_progress_saved(monkeypatch) -> None:
+    fake_proc = _FakeRunningProc()
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: fake_proc)
+    times = iter([1000.0, 1200.0])
+    monkeypatch.setattr(server.time, "time", lambda: next(times, 1200.0))
+
+    result = server.tool_wiki_sync({"dry_run": True})
+
+    assert fake_proc.terminated is True
+    assert result["isError"] is True
+    assert result["content"][0]["text"].startswith("sync stopped after 120s; progress saved")
