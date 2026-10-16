@@ -23,6 +23,7 @@ Ships as stdlib-only Python — no MCP SDK dependency.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
