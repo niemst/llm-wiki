@@ -756,7 +756,11 @@ def tool_wiki_sync(args: dict[str, Any]) -> dict[str, Any]:
     output = "".join(captured)
     if truncated:
         output += f"\n[output truncated at {OUTPUT_CAP_BYTES // 1024} KB]"
-    return _ok(output or "(no output)")
+    if proc.returncode == 0:
+        return _ok(output or "(no output)")
+    if proc.returncode == 1:
+        return _ok(f"sync finished with per-file errors; site build skipped\n{output}")
+    return _err(f"sync exited with code {proc.returncode}\n{output}")
 
 
 def tool_wiki_export(args: dict[str, Any]) -> dict[str, Any]:
@@ -1034,8 +1038,9 @@ def handle_tools_call(params: dict[str, Any]) -> dict[str, Any]:
     except Exception as e:
         result = _err(f"Internal error in {name}: {e}")
     note = _stale_code_note()
-    if note:
-        result["content"].append({"type": "text", "text": note})
+    content = result.get("content")
+    if note and isinstance(content, list):
+        content.append({"type": "text", "text": note})
     return result
 
 
@@ -1052,33 +1057,35 @@ STALE_CODE_NOTE = (
     "note: brain MCP server code changed on disk since this server started; "
     "run /mcp and reconnect brain to load it"
 )
-_started_code_mtime = 0.0
+_started_code_signature: tuple[int, float] = (0, 0.0)
 _last_stale_check = float("-inf")
+_code_changed = False
 
 
-def _newest_code_mtime() -> float:
+def _code_signature() -> tuple[int, float]:
     mtimes = []
     for path in CODE_ROOT.rglob("*.py"):
         try:
             mtimes.append(path.stat().st_mtime)
         except OSError:
             continue
-    return max(mtimes, default=0.0)
+    return (len(mtimes), max(mtimes, default=0.0))
 
 
 def _init_code_watch() -> None:
-    global _started_code_mtime, _last_stale_check
-    _started_code_mtime = _newest_code_mtime()
+    global _started_code_signature, _last_stale_check, _code_changed
+    _started_code_signature = _code_signature()
     _last_stale_check = float("-inf")
+    _code_changed = False
 
 
 def _stale_code_note() -> str:
-    global _last_stale_check
+    global _last_stale_check, _code_changed
     now = time.monotonic()
-    if now - _last_stale_check < STALE_CODE_CHECK_INTERVAL_S:
-        return ""
-    _last_stale_check = now
-    return STALE_CODE_NOTE if _newest_code_mtime() > _started_code_mtime else ""
+    if not _code_changed and now - _last_stale_check >= STALE_CODE_CHECK_INTERVAL_S:
+        _last_stale_check = now
+        _code_changed = _code_signature() != _started_code_signature
+    return STALE_CODE_NOTE if _code_changed else ""
 
 
 def send(message: dict[str, Any]) -> None:

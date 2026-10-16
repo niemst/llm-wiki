@@ -79,6 +79,26 @@ def test_shim_unconfirmed_live_request_downgrades_to_dry_run(popen):
     assert popen.started[0][0][-2:] == ["mcp-sync", "--dry-run"]
 
 
+def test_shim_dry_run_starts_no_build(popen):
+    server.tool_wiki_sync({"dry_run": True})
+    assert len(popen.started) == 1
+    assert "build" not in popen.started[0][0]
+
+
+def test_shim_per_file_errors_is_ok_with_build_skipped(popen):
+    popen.returncode = 1
+    result = server.tool_wiki_sync({"dry_run": False, "confirm": True})
+    assert result["isError"] is False
+    assert result["content"][0]["text"].startswith("sync finished with per-file errors; site build skipped\n")
+
+
+def test_shim_unexpected_exit_code_is_error(popen):
+    popen.returncode = 2
+    result = server.tool_wiki_sync({"dry_run": False, "confirm": True})
+    assert result["isError"] is True
+    assert "summary: 1 converted" in result["content"][0]["text"]
+
+
 def test_live_sync_converts_then_starts_detached_build(popen, convert):
     assert cli.main(["mcp-sync"]) == 0
     assert convert.dry_run_seen == [False]
